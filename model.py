@@ -6,7 +6,9 @@ import numpy as np
 from utils.distributions import Categorical, DiagGaussian
 from utils.model import get_grid, ChannelPool, Flatten, NNBase
 import envs.utils.depth_utils as du
-
+from tsog import TSOG
+from tsog_sem_exp import TSOGSemExp
+from arguments import get_args
 
 class Goal_Oriented_Semantic_Policy(NNBase):
 
@@ -128,6 +130,147 @@ class RL_Policy(nn.Module):
 
         return value, action_log_probs, dist_entropy, rnn_hxs
 
+# https://github.com/ikostrikov/pytorch-a2c-ppo-acktr-gail/blob/master/a2c_ppo_acktr/model.py#L15
+class TSOG_RL_Policy(nn.Module):
+
+    def __init__(self, args, model_type=0):
+
+        super(TSOG_RL_Policy, self).__init__()
+        if model_type == 1:
+            self.network = TSOG(args)
+        else:
+            raise NotImplementedError
+
+        self.model_type = model_type
+        self.is_recurrent = False
+
+    @property
+    def rec_state_size(self):
+        """Size of rnn_hx."""
+        return self.network.lstm_hidden_dim
+
+    def forward(self, state, goal_cat_id, rnn_hxs, action_probs, detection_results, gat_embedding_memory):
+        return self.network(state, goal_cat_id, rnn_hxs, action_probs, detection_results, gat_embedding_memory)
+
+    def act(self, state, goal_cat_id, rnn_hxs, action_probs, detection_results, gat_embedding_memory, training=True):
+
+        value, actor_features, rnn_hxs, gat_embedding_memory = self(state, 
+                                                                    goal_cat_id, 
+                                                                    rnn_hxs, 
+                                                                    action_probs, 
+                                                                    detection_results, 
+                                                                    gat_embedding_memory
+                                                                )
+
+        action_probs = F.softmax(actor_features, dim=1)
+
+        if training:
+            action = action_probs.multinomial(1).data
+        else:
+            action = action_probs.argmax(dim=1, keepdim=True)
+
+        action_log_probs = F.log_softmax(actor_features, dim=1)     # (25, 4)
+        entropy = -(action_log_probs * action_probs).sum(1)
+        action_log_probs = action_log_probs.gather(1, action)       # (25, 1)
+
+        return action, value, action_probs, action_log_probs, rnn_hxs, gat_embedding_memory
+
+    def get_value(self, state, goal_cat_id, rnn_hxs, action_probs, detection_results, gat_embedding_memory):
+        value, actor_features, rnn_hxs, gat_embedding_memory = self(state, 
+                                                                    goal_cat_id, 
+                                                                    rnn_hxs, 
+                                                                    action_probs, 
+                                                                    detection_results, 
+                                                                    gat_embedding_memory
+                                                                )
+        return value
+
+    def evaluate_actions(self, state, goal_cat_id, rnn_hxs, action_probs, detection_results, gat_embedding_memory):
+
+        value, actor_features, rnn_hxs, gat_embedding_memory = self(state, 
+                                                                    goal_cat_id, 
+                                                                    rnn_hxs, 
+                                                                    action_probs, 
+                                                                    detection_results, 
+                                                                    gat_embedding_memory
+                                                                )
+
+        old_action = action_probs.multinomial(1).data
+
+        old_action_log_probs = torch.log(action_probs)     # (500, 4)
+        entropy = -(old_action_log_probs * action_probs).sum(-1).mean() # (500)
+        action_log_probs = old_action_log_probs.gather(1, old_action)       # (500, 1)
+
+        return value, action_log_probs, entropy, rnn_hxs
+
+# https://github.com/ikostrikov/pytorch-a2c-ppo-acktr-gail/blob/master/a2c_ppo_acktr/model.py#L15
+class TSOGSemExp_RL_Policy(nn.Module):
+
+    def __init__(self, args, obs_shape, action_space, model_type=0,
+                 base_kwargs=None):
+
+        super(TSOGSemExp_RL_Policy, self).__init__()
+        if base_kwargs is None:
+            base_kwargs = {}
+
+        if model_type == 1:
+            self.network = TSOGSemExp(args, obs_shape, **base_kwargs)
+        else:
+            raise NotImplementedError
+
+        if action_space.__class__.__name__ == "Discrete":
+            num_outputs = action_space.n
+            self.dist = Categorical(self.network.output_size, num_outputs)
+        elif action_space.__class__.__name__ == "Box":
+            num_outputs = action_space.shape[0]
+            self.dist = DiagGaussian(self.network.output_size, num_outputs)
+        else:
+            raise NotImplementedError
+
+        self.model_type = model_type
+
+    @property
+    def is_recurrent(self):
+        return self.network.is_recurrent
+
+    @property
+    def rec_state_size(self):
+        """Size of rnn_hx."""
+        return self.network.rec_state_size
+
+    def forward(self, inputs, rnn_hxs, masks, extras, target_class_embedding, gat_embedding_memory=None):
+        if extras is None:
+            return self.network(inputs, rnn_hxs, masks, target_class_embedding, gat_embedding_memory)
+        else:
+            return self.network(inputs, rnn_hxs, masks, extras, target_class_embedding, gat_embedding_memory)
+
+    def act(self, inputs, rnn_hxs, masks, target_class_embedding, gat_embedding_memory=None, extras=None, deterministic=False):
+
+        value, actor_features, rnn_hxs, gat_embedding_memory = self(inputs, rnn_hxs, masks, extras, target_class_embedding, gat_embedding_memory)
+        dist = self.dist(actor_features)
+
+        if deterministic:
+            action = dist.mode()
+        else:
+            action = dist.sample()
+
+        action_log_probs = dist.log_probs(action)
+
+        return value, action, action_log_probs, rnn_hxs, gat_embedding_memory
+
+    def get_value(self, inputs, rnn_hxs, masks, target_class_embedding, gat_embedding_memory=None, extras=None):
+        value, _, _, _ = self(inputs, rnn_hxs, masks, extras, target_class_embedding, gat_embedding_memory)
+        return value
+
+    def evaluate_actions(self, inputs, rnn_hxs, masks, action, target_class_embedding, gat_embedding_memory=None, extras=None):
+
+        value, actor_features, rnn_hxs, _ = self(inputs, rnn_hxs, masks, extras, target_class_embedding, gat_embedding_memory=None)
+        dist = self.dist(actor_features)
+
+        action_log_probs = dist.log_probs(action)
+        dist_entropy = dist.entropy().mean()
+
+        return value, action_log_probs, dist_entropy, rnn_hxs
 
 class Semantic_Mapping(nn.Module):
 

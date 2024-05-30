@@ -19,7 +19,7 @@ def get_args():
     parser.add_argument('--num_processes_on_first_gpu', type=int, default=1)
     parser.add_argument('--eval', type=int, default=0,
                         help='0: Train, 1: Evaluate (default: 0)')
-    parser.add_argument('--num_training_frames', type=int, default=10000000,
+    parser.add_argument('--num_training_frames', type=int, default=6000000,
                         help='total number of training frames')
     parser.add_argument('--num_eval_episodes', type=int, default=200,
                         help="number of test episodes per scene")
@@ -148,6 +148,13 @@ def get_args():
     parser.add_argument('--map_pred_threshold', type=float, default=1.0)
     parser.add_argument('--exp_pred_threshold', type=float, default=1.0)
     parser.add_argument('--collision_threshold', type=float, default=0.20)
+
+    # Args for TSOG
+    parser.add_argument('--action_space', type=int, default=4)
+    parser.add_argument('--hidden_state_sz', type=int, default=512)
+    parser.add_argument('--num_category', type=int, default=15)
+    parser.add_argument('--dropout_rate', type=float, default=0.25)
+    parser.add_argument('--gat_memory_len', type=int, default=25)
 
     # parse arguments
     args = parser.parse_args()

@@ -9,12 +9,192 @@ from torchvision import transforms
 from envs.utils.fmm_planner import FMMPlanner
 from envs.habitat.objectgoal_env import ObjectGoal_Env
 from agents.utils.semantic_prediction import SemanticPredMaskRCNN
-from constants import color_palette
+from constants import color_palette, GOAL_SUCCESS_REWARD, MOVEAHEAD_REWARD, DONE_ACTION_INT, STEP_PENALTY
 import envs.utils.pose as pu
 import agents.utils.visualization as vu
+from torchvision import models
+import torch.nn as nn
 
 
-class Sem_Exp_Env_Agent(ObjectGoal_Env):
+class TSOG_Agent(ObjectGoal_Env):
+    """The TSOG_Agent environment agent class.
+
+    """
+
+    def __init__(self, args, rank, config_env, dataset):
+
+        self.args = args
+        super().__init__(args, rank, config_env, dataset)
+
+        # initialize transform for RGB observations
+        class ScaleBothSides(object):
+            """Rescales the input PIL.Image to the given 'size'.
+            'size' will be the size of both edges, and this can change aspect ratio.
+            size: output size of both edges
+            interpolation: Default: PIL.Image.BILINEAR
+            """
+            def __init__(self, size, interpolation=Image.Resampling.BILINEAR):
+                self.size = size
+                self.interpolation = interpolation
+
+            def __call__(self, img):
+                return img.resize((self.size, self.size), self.interpolation)
+        
+        normalize = transforms.Normalize(
+            mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        self.resnet18_transform = transforms.Compose([
+                transforms.ToPILImage(),
+                ScaleBothSides(224),
+                transforms.ToTensor(),
+                normalize,
+            ])
+
+        resnet18 = models.resnet18(pretrained=True)
+        self.resnet18 = nn.Sequential(*list(resnet18.children())[:-2]).to(args.device)
+        for p in self.resnet18.parameters():
+            p.requires_grad = False
+
+        # initialize semantic segmentation prediction model
+        if args.sem_gpu_id == -1:
+            args.sem_gpu_id = config_env.SIMULATOR.HABITAT_SIM_V0.GPU_DEVICE_ID
+
+        self.sem_pred = SemanticPredMaskRCNN(args)
+
+        self.state = None
+        self.state_shape = None
+        self.detection_results = None
+        self.detection_results_shape = None
+        self.collision_map = None
+        self.visited = None
+        self.visited_vis = None
+        self.col_width = None
+        self.curr_loc = None
+        self.last_loc = None
+        self.last_action = None
+        self.count_forward_actions = None
+
+        if args.visualize or args.print_images:
+            self.legend = cv2.imread('docs/legend.png')
+            self.vis_image = None
+            self.rgb_vis = None
+
+    def reset(self):
+        args = self.args
+
+        obs, info = super().reset()
+        state, detection_results = self._preprocess_obs(obs)
+
+        self.state_shape = state.shape
+        self.detection_results_shape = detection_results.shape
+
+        # Episode initializations
+        map_shape = (args.map_size_cm // args.map_resolution,
+                     args.map_size_cm // args.map_resolution)
+        self.collision_map = np.zeros(map_shape)
+        self.visited = np.zeros(map_shape)
+        self.visited_vis = np.zeros(map_shape)
+        self.col_width = 1
+        self.count_forward_actions = 0
+        self.curr_loc = [args.map_size_cm / 100.0 / 2.0,
+                         args.map_size_cm / 100.0 / 2.0, 0.]
+        self.last_action = None
+
+        if args.visualize or args.print_images:
+            self.vis_image = vu.init_vis_image(self.goal_name, self.legend)
+
+        return state, detection_results, info
+
+    def plan_act_and_preprocess(self, planner_inputs):
+        """Function responsible for planning, taking the action and
+        preprocessing observations
+
+        Args:
+            planner_inputs (dict):
+                dict with following keys:
+                    'map_pred'  (ndarray): (M, M) map prediction
+                    'goal'      (ndarray): (M, M) mat denoting goal locations
+                    'pose_pred' (ndarray): (7,) array denoting pose (x,y,o)
+                                 and planning window (gx1, gx2, gy1, gy2)
+                     'found_goal' (bool): whether the goal object is found
+
+        Returns:
+            obs (ndarray): preprocessed observations ((4+C) x H x W)
+            reward (float): amount of reward returned after previous action
+            done (bool): whether the episode has ended
+            info (dict): contains timestep, pose, goal category and
+                         evaluation metric info
+        """
+
+        # plan
+        if planner_inputs["wait"]:
+            self.last_action = None
+            self.info["sensor_pose"] = [0., 0., 0.]
+            return np.zeros(self.state_shape), np.zeros(self.detection_results_shape), 0., False, self.info
+
+        # Reset reward if new long-term goal
+        if planner_inputs["new_goal"]:
+            self.info["g_reward"] = 0
+
+        action = planner_inputs["action"]
+
+        if action >= 0:
+
+            # act
+            action = {'action': int(action)}
+            obs, rew, done, info = super().step(action)
+            # reward
+            rew += STEP_PENALTY
+            if action == 1:
+                rew += MOVEAHEAD_REWARD
+            if done:
+                if info["success"]:
+                    rew = GOAL_SUCCESS_REWARD
+
+            # preprocess obs
+            state, detection_results = self._preprocess_obs(obs) 
+            self.last_action = action['action']
+            self.state = state
+            self.info = info
+
+            info['g_reward'] += rew
+
+            return state, detection_results, rew, done, info
+
+        else:
+            self.last_action = None
+            self.info["sensor_pose"] = [0., 0., 0.]
+            return np.zeros(self.state_shape), np.zeros(self.detection_results_shape), 0., False, self.info
+
+    # 返回的是一个4维的数组，第一维是RGB，第二维是深度，第三维是语义分割
+    def _preprocess_obs(self, obs, use_seg=True):
+        obs = obs.transpose(1, 2, 0)
+        rgb = obs[:, :, :3]
+        
+        # 转换 rgb 到 resnet18 的输入格式   [480, 640, 3] -> [3, 224, 224]
+        transformed_rgb = self.resnet18_transform(rgb.astype(np.uint8))
+        # [512, 7, 7]
+        state = self.resnet18(transformed_rgb.unsqueeze(0).to(self.args.device))[0].detach().cpu().numpy()
+
+        detection_results = self._get_sem_pred(
+            rgb.astype(np.uint8), use_seg=use_seg)      # (15, 1024+1+4)
+
+        detection_results[:, 1025] = detection_results[:, 1025] / self.args.env_frame_width
+        detection_results[:, 1026] = detection_results[:, 1026] / self.args.env_frame_height
+        detection_results[:, 1027] = detection_results[:, 1027] / self.args.env_frame_width
+        detection_results[:, 1028] = detection_results[:, 1028] / self.args.env_frame_height
+
+        return state, detection_results
+
+    def _get_sem_pred(self, rgb, use_seg=True):
+        if use_seg:
+            detection_results = self.sem_pred.tsog_get_prediction(rgb)
+            detection_results = detection_results.astype(np.float32)        # (15, 1024+1+4)
+        else:
+            detection_results = np.zeros((15, 1024+1+4))
+            self.rgb_vis = rgb[:, :, ::-1]
+        return detection_results
+
+class TSOGSemExp_Env_Agent(ObjectGoal_Env):
     """The Sem_Exp environment agent class. A seperate Sem_Exp_Env_Agent class
     object is used for each environment thread.
 
@@ -42,6 +222,8 @@ class Sem_Exp_Env_Agent(ObjectGoal_Env):
 
         self.obs = None
         self.obs_shape = None
+        self.detection_results = None
+        self.detection_results_shape = None
         self.collision_map = None
         self.visited = None
         self.visited_vis = None
@@ -60,9 +242,10 @@ class Sem_Exp_Env_Agent(ObjectGoal_Env):
         args = self.args
 
         obs, info = super().reset()
-        obs = self._preprocess_obs(obs)
+        obs, detection_results = self._preprocess_obs(obs)
 
         self.obs_shape = obs.shape
+        self.detection_results_shape = detection_results.shape
 
         # Episode initializations
         map_shape = (args.map_size_cm // args.map_resolution,
@@ -79,7 +262,7 @@ class Sem_Exp_Env_Agent(ObjectGoal_Env):
         if args.visualize or args.print_images:
             self.vis_image = vu.init_vis_image(self.goal_name, self.legend)
 
-        return obs, info
+        return obs, detection_results, info
 
     def plan_act_and_preprocess(self, planner_inputs):
         """Function responsible for planning, taking the action and
@@ -106,7 +289,7 @@ class Sem_Exp_Env_Agent(ObjectGoal_Env):
         if planner_inputs["wait"]:
             self.last_action = None
             self.info["sensor_pose"] = [0., 0., 0.]
-            return np.zeros(self.obs.shape), 0., False, self.info
+            return np.zeros(self.obs.shape), np.zeros(self.detection_results.shape), 0., False, self.info
 
         # Reset reward if new long-term goal
         if planner_inputs["new_goal"]:
@@ -124,19 +307,20 @@ class Sem_Exp_Env_Agent(ObjectGoal_Env):
             obs, rew, done, info = super().step(action)
 
             # preprocess obs
-            obs = self._preprocess_obs(obs) 
+            obs, detection_results = self._preprocess_obs(obs) 
             self.last_action = action['action']
             self.obs = obs
+            self.detection_results = detection_results
             self.info = info
 
             info['g_reward'] += rew
 
-            return obs, rew, done, info
+            return obs, detection_results, rew, done, info
 
         else:
             self.last_action = None
             self.info["sensor_pose"] = [0., 0., 0.]
-            return np.zeros(self.obs_shape), 0., False, self.info
+            return np.zeros(self.obs_shape), np.zeros(self.detection_results_shape), 0., False, self.info
 
     def _plan(self, planner_inputs):
         """Function responsible for planning
@@ -297,9 +481,15 @@ class Sem_Exp_Env_Agent(ObjectGoal_Env):
         rgb = obs[:, :, :3]
         depth = obs[:, :, 3:4]
 
-        sem_seg_pred = self._get_sem_pred(
+        sem_seg_pred, detection_results = self._get_sem_pred(
             rgb.astype(np.uint8), use_seg=use_seg)
         depth = self._preprocess_depth(depth, args.min_depth, args.max_depth)
+
+        # (15, 1024+1+4)
+        detection_results[:, 1025] = detection_results[:, 1025] / self.args.env_frame_width
+        detection_results[:, 1026] = detection_results[:, 1026] / self.args.env_frame_height
+        detection_results[:, 1027] = detection_results[:, 1027] / self.args.env_frame_width
+        detection_results[:, 1028] = detection_results[:, 1028] / self.args.env_frame_height
 
         ds = args.env_frame_width // args.frame_width  # Downscaling factor
         if ds != 1:
@@ -311,7 +501,7 @@ class Sem_Exp_Env_Agent(ObjectGoal_Env):
         state = np.concatenate((rgb, depth, sem_seg_pred),
                                axis=2).transpose(2, 0, 1)
 
-        return state
+        return state, detection_results
 
     def _preprocess_depth(self, depth, min_d, max_d):
         depth = depth[:, :, 0] * 1
@@ -329,12 +519,14 @@ class Sem_Exp_Env_Agent(ObjectGoal_Env):
 
     def _get_sem_pred(self, rgb, use_seg=True):
         if use_seg:
-            semantic_pred, self.rgb_vis = self.sem_pred.get_prediction(rgb)
+            semantic_pred, detection_results, self.rgb_vis = self.sem_pred.tsog_get_prediction(rgb, semantic=True)
+            detection_results = detection_results.astype(np.float32)        # (15, 1024+1+4)
             semantic_pred = semantic_pred.astype(np.float32)
         else:
             semantic_pred = np.zeros((rgb.shape[0], rgb.shape[1], 16))
+            detection_results = np.zeros((15, 1024+1+4))
             self.rgb_vis = rgb[:, :, ::-1]
-        return semantic_pred
+        return semantic_pred, detection_results
 
     def _visualize(self, inputs):
         args = self.args

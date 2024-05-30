@@ -142,3 +142,10 @@ tmp/
 pretrained_models/
 data/
 data
+
+# result
+result/
+
+.vector_cache
+tsog_tmp/
+sog_tmp/

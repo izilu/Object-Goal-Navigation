@@ -4,8 +4,12 @@ from .habitat import construct_envs
 
 
 def make_vec_envs(args):
-    envs = construct_envs(args)
-    envs = VecPyTorch(envs, args.device)
+    envs = construct_envs(args)     # VecEnv
+    # envs = VecPyTorch(envs, args.device)    # VecPyTorch
+    if args.agent == "tsog" or args.agent == "tsog_sem_exp":
+        envs = TSOGVecPyTorch(envs, args.device)    # TSOGVecPyTorch
+    else:
+        envs = VecPyTorch(envs, args.device)
     return envs
 
 
@@ -52,6 +56,54 @@ class VecPyTorch():
         obs = torch.from_numpy(obs).float().to(self.device)
         reward = torch.from_numpy(reward).float()
         return obs, reward, done, info
+
+    def close(self):
+        return self.venv.close()
+
+class TSOGVecPyTorch():
+    def __init__(self, venv, device):
+        self.venv = venv
+        self.num_envs = venv.num_envs
+        self.observation_space = venv.observation_space
+        self.action_space = venv.action_space
+        self.device = device
+
+    def reset(self):
+        state, detection_results, info = self.venv.reset()
+        state = torch.from_numpy(state).float().to(self.device)
+        detection_results = torch.from_numpy(detection_results).float().to(self.device)
+        return state, detection_results, info
+
+    def step_async(self, actions):
+        actions = actions.cpu().numpy()
+        self.venv.step_async(actions)
+
+    def step_wait(self):
+        state, detection_results, reward, done, info = self.venv.step_wait()
+        state = torch.from_numpy(state).float().to(self.device)
+        detection_results = torch.from_numpy(detection_results).float().to(self.device)
+        reward = torch.from_numpy(reward).float()
+        return state, detection_results, reward, done, info
+
+    def step(self, actions):
+        actions = actions.cpu().numpy()
+        state, detection_results, reward, done, info = self.venv.step(actions)
+        state = torch.from_numpy(state).float().to(self.device)
+        detection_results = torch.from_numpy(detection_results).float().to(self.device)
+        reward = torch.from_numpy(reward).float()
+        return state, detection_results, reward, done, info
+
+    def get_rewards(self, inputs):
+        reward = self.venv.get_rewards(inputs)
+        reward = torch.from_numpy(reward).float()
+        return reward
+
+    def plan_act_and_preprocess(self, inputs):
+        state, detection_results, reward, done, info = self.venv.plan_act_and_preprocess(inputs)
+        state = torch.from_numpy(state).float().to(self.device)
+        detection_results = torch.from_numpy(detection_results).float().to(self.device)
+        reward = torch.from_numpy(reward).float()
+        return state, detection_results, reward, done, info
 
     def close(self):
         return self.venv.close()

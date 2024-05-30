@@ -8,8 +8,8 @@ import torch.nn as nn
 import torch
 import numpy as np
 
-from model import RL_Policy, Semantic_Mapping
-from utils.storage import GlobalRolloutStorage
+from model import RL_Policy, Semantic_Mapping, TSOGSemExp_RL_Policy
+from utils.storage import GlobalRolloutStorage, TSOGSemExpGlobalRolloutStorage
 from envs import make_vec_envs
 from arguments import get_args
 import algo
@@ -81,7 +81,7 @@ def main():
     # Starting environments
     torch.set_num_threads(1)
     envs = make_vec_envs(args)      # spawn n 个环境，n 个子进程
-    obs, infos = envs.reset()
+    obs, detection_results, infos = envs.reset()
 
     torch.set_grad_enabled(False)
 
@@ -95,9 +95,9 @@ def main():
     nc = args.num_sem_categories + 4  # num channels
 
     # Calculating full and local map sizes
-    map_size = args.map_size_cm // args.map_resolution
-    full_w, full_h = map_size, map_size
-    local_w = int(full_w / args.global_downscaling)
+    map_size = args.map_size_cm // args.map_resolution      # 480
+    full_w, full_h = map_size, map_size     # 480
+    local_w = int(full_w / args.global_downscaling)        # 240
     local_h = int(full_h / args.global_downscaling)
 
     # Initializing full and local map
@@ -207,7 +207,7 @@ def main():
     init_map_and_pose()
 
     # Global policy observation space
-    ngc = 8 + args.num_sem_categories
+    ngc = 8 + args.num_sem_categories       # 24
     es = 2
     g_observation_space = gym.spaces.Box(0, 1,
                                          (ngc,
@@ -226,13 +226,13 @@ def main():
     sem_map_module.eval()
 
     # Global policy
-    g_policy = RL_Policy(g_observation_space.shape, g_action_space,
+    g_policy = TSOGSemExp_RL_Policy(args, g_observation_space.shape, g_action_space,
                          model_type=1,
                          base_kwargs={'recurrent': args.use_recurrent_global,
                                       'hidden_size': g_hidden_size,
                                       'num_sem_categories': ngc - 8
                                       }).to(device)
-    g_agent = algo.PPO(g_policy, args.clip_param, args.ppo_epoch,
+    g_agent = algo.TSOGSemExpPPO(g_policy, args.clip_param, args.ppo_epoch,
                        args.num_mini_batch, args.value_loss_coef,
                        args.entropy_coef, lr=args.lr, eps=args.eps,
                        max_grad_norm=args.max_grad_norm)
@@ -243,10 +243,10 @@ def main():
     extras = torch.zeros(num_scenes, 2)     # [25, 2] for train
 
     # Storage
-    g_rollouts = GlobalRolloutStorage(args.num_global_steps,
+    g_rollouts = TSOGSemExpGlobalRolloutStorage(args.num_global_steps,
                                       num_scenes, g_observation_space.shape,
                                       g_action_space, g_policy.rec_state_size,
-                                      es).to(device)
+                                      es, (15, 1024+1+4), args.gat_memory_len).to(device)
 
     if args.load != "0":
         print("Loading model {}".format(args.load))
@@ -267,7 +267,7 @@ def main():
 
     # Compute Global policy input
     locs = local_pose.cpu().numpy()
-    global_input = torch.zeros(num_scenes, ngc, local_w, local_h)
+    global_input = torch.zeros(num_scenes, ngc, local_w, local_h)       # (25, 24, 240, 240)
     global_orientation = torch.zeros(num_scenes, 1).long()
 
     for e in range(num_scenes):
@@ -292,14 +292,17 @@ def main():
     extras[:, 1] = goal_cat_id
 
     g_rollouts.obs[0].copy_(global_input)
+    g_rollouts.detection_results[0].copy_(detection_results)
     g_rollouts.extras[0].copy_(extras)
 
     # Run Global Policy (global_goals = Long-Term Goal)
-    g_value, g_action, g_action_log_prob, g_rec_states = \
+    g_value, g_action, g_action_log_prob, g_rec_states, gat_embedding_memory = \
         g_policy.act(
             g_rollouts.obs[0],
             g_rollouts.rec_states[0],
             g_rollouts.masks[0],
+            g_rollouts.detection_results[0],
+            # g_rollouts.gat_embedding_memorys[0],          # for sog w.o. gat_memory
             extras=g_rollouts.extras[0],
             deterministic=False
         )
@@ -329,7 +332,7 @@ def main():
             p_input['sem_map_pred'] = local_map[e, 4:, :, :
                                                 ].argmax(0).cpu().numpy()
 
-    obs, _, done, infos = envs.plan_act_and_preprocess(planner_inputs)
+    obs, detection_results, _, done, infos = envs.plan_act_and_preprocess(planner_inputs)
 
     start = time.time()
     g_reward = 0
@@ -369,6 +372,7 @@ def main():
                     episode_spl.append(spl)
                     episode_dist.append(dist)
                 wait_env[e] = 1.
+                # g_rollouts.reset_gat_mem(e)       # for sog w.o. gat_memory
                 update_intrinsic_rew(e)
                 init_map_and_pose_for_env(e)
         # ------------------------------------------------------------------
@@ -468,15 +472,17 @@ def main():
                 g_rollouts.insert(
                     global_input, g_rec_states,
                     g_action, g_action_log_prob, g_value,
-                    g_reward, g_masks, extras
+                    g_reward, g_masks, extras, detection_results, gat_embedding_memory
                 )
 
             # Sample long-term goal from global policy
-            g_value, g_action, g_action_log_prob, g_rec_states = \
+            g_value, g_action, g_action_log_prob, g_rec_states, gat_embedding_memory = \
                 g_policy.act(
                     g_rollouts.obs[g_step + 1],
                     g_rollouts.rec_states[g_step + 1],
                     g_rollouts.masks[g_step + 1],
+                    g_rollouts.detection_results[g_step + 1],
+                    # g_rollouts.gat_embedding_memorys[g_step + 1],         # for sog w.o. gat_memory
                     extras=g_rollouts.extras[g_step + 1],
                     deterministic=False
                 )
@@ -527,7 +533,7 @@ def main():
                 p_input['sem_map_pred'] = local_map[e, 4:, :,
                                                     :].argmax(0).cpu().numpy()
 
-        obs, _, done, infos = envs.plan_act_and_preprocess(planner_inputs)
+        obs, detection_results, _, done, infos = envs.plan_act_and_preprocess(planner_inputs)
         # ------------------------------------------------------------------
 
         # ------------------------------------------------------------------
@@ -540,6 +546,8 @@ def main():
                     g_rollouts.obs[-1],
                     g_rollouts.rec_states[-1],
                     g_rollouts.masks[-1],
+                    g_rollouts.detection_results[-1],
+                    # g_rollouts.gat_embedding_memorys[-1],         # for sog w.o. gat_memory
                     extras=g_rollouts.extras[-1]
                 ).detach()
 

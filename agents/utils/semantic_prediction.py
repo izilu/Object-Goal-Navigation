@@ -36,7 +36,7 @@ class SemanticPredMaskRCNN():
         if args.visualize == 2:
             img = vis_output.get_image()
 
-        semantic_input = np.zeros((img.shape[0], img.shape[1], 15 + 1))
+        semantic_input = np.zeros((img.shape[0], img.shape[1], 15 + 1))     # 15 classes
 
         for j, class_idx in enumerate(
                 seg_predictions[0]['instances'].pred_classes.cpu().numpy()):
@@ -46,6 +46,30 @@ class SemanticPredMaskRCNN():
                 semantic_input[:, :, idx] += obj_mask.cpu().numpy()
 
         return semantic_input, img
+    
+    def tsog_get_prediction(self, img, semantic=False):
+        image_list = []
+        img = img[:, :, ::-1]
+        image_list.append(img)
+        seg_predictions, appear_embeedings = self.segmentation_model.tsog_get_predictions(image_list)
+
+        semantic_input = np.zeros((img.shape[0], img.shape[1], 15 + 1))     # 15 classes
+        detection_results = np.zeros((15, 1024+1+4))     # 15 classes
+
+        for j, class_idx in enumerate( 
+                seg_predictions[0]['instances'].pred_classes.cpu().numpy()):
+            if class_idx in list(coco_categories_mapping.keys()):
+                idx = coco_categories_mapping[class_idx]
+                obj_mask = seg_predictions[0]['instances'].pred_masks[j] * 1.
+                semantic_input[:, :, idx] += obj_mask.cpu().numpy()
+                detection_results[idx, :-5] = appear_embeedings[j].cpu().numpy()
+                detection_results[idx, -5] = seg_predictions[0]['instances'].scores[j]
+                detection_results[idx, -4:] = seg_predictions[0]['instances'].pred_boxes[j].tensor.cpu().numpy()
+
+        if semantic:
+            return semantic_input, detection_results, img
+        else:
+            return detection_results
 
 
 def compress_sem_map(sem_map):
@@ -81,6 +105,9 @@ class ImageSegmentation():
 
     def get_predictions(self, img, visualize=0):
         return self.demo.run_on_image(img, visualize=visualize)
+    
+    def tsog_get_predictions(self, img):
+        return self.demo.tsog_run_on_image(img)
 
 
 def setup_cfg(args):
@@ -187,6 +214,12 @@ class VisualizationDemo(object):
                         predictions=instances)
 
         return all_predictions, vis_output
+    
+    def tsog_run_on_image(self, image_list):
+        all_predictions, appear_embeddings = self.predictor.tsog_call(image_list)
+        # Convert image from OpenCV BGR format to Matplotlib RGB format.
+
+        return all_predictions, appear_embeddings
 
 
 class BatchPredictor:
@@ -250,3 +283,28 @@ class BatchPredictor:
         with torch.no_grad():
             predictions = self.model(inputs)
             return predictions
+        
+    def tsog_call(self, image_list):
+        inputs = []
+        for original_image in image_list:
+            # https://github.com/sphinx-doc/sphinx/issues/4258
+            # Apply pre-processing to image.
+            if self.input_format == "RGB":
+                # whether the model expects BGR inputs or RGB
+                original_image = original_image[:, :, ::-1]
+            height, width = original_image.shape[:2]
+            image = original_image
+            image = torch.as_tensor(image.astype("float32").transpose(2, 0, 1))
+
+            instance = {"image": image, "height": height, "width": width}
+
+            inputs.append(instance)
+
+        with torch.no_grad():
+            predictions = self.model(inputs)
+            images = torch.stack([x["image"].to(self.model.device) for x in inputs])
+            features = self.model.backbone(images)
+            mask_features = [features[f] for f in self.model.roi_heads.in_features]
+            mask_features = self.model.roi_heads.box_pooler(mask_features, [x.pred_boxes for x in [predictions[0]['instances']]])
+            appear_embeddings = self.model.roi_heads.box_head(mask_features)
+            return predictions, appear_embeddings
